@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ashtray Particles</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; touch-action: none; }
+    #ui {
+      position: fixed; left: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      font: 13px/1.4 system-ui, sans-serif; color: #fff;
+    }
+    #ui button {
+      font: inherit; color: #fff; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.4);
+      border-radius: 6px; padding: 8px 12px; cursor: pointer;
+    }
+    #ui button[aria-pressed="false"] { opacity: .5; }
+    #ui span { text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #fff; font: 14px system-ui; }
+  </style>
+</head>
+<body>
+  <div id="loading">불러오는 중...</div>
+  <div id="ui">
+    <button id="faceBtn" aria-pressed="true">얼굴 ⏸</button>
+    <button id="bowBtn" aria-pressed="true">리본 ⏸</button>
+    <span>얼굴이나 리본을 클릭해도 켜고 끌 수 있어요</span>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/",
+      "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.4.0/dist/spark.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { SparkRenderer, SplatMesh, dyno } from "@sparkjsdev/spark";
+
+    // ===== 여기 값을 바꿔 보세요 =====
+    const SPLAT_FILE = "splat.ply";
+    const BACKGROUND = "#000000";          // SuperSplat에서 정한 배경색 (검정)
+
+    // 얼굴과 리본을 나누는 높이 (파일 좌표 y). 이 값보다 작으면 리본 (리본이 얼굴 판 뒤쪽에 붙어 있음)
+    const SPLIT_Y = -0.005;
+    const BOW_CENTER  = [-0.159, -0.014, 0.216];  // 리본 중심 — 여기서 바깥으로 퍼짐
+    const FACE_CENTER = [0.091, 0.028, -0.031];   // 얼굴 중심
+
+    const BOW  = { spread: 0.12, period: 3.0, phase: 0.0 };  // 퍼지는 거리, 한 번 숨 쉬는 시간(초), 시작 시점(0~1)
+    const FACE = { spread: 0.18, period: 4.0, phase: 0.5 };  // phase 0.5 = 리본과 엇갈리게
+    const PARTICLE_SIZE = 0.35;   // 퍼졌을 때 점 크기 (1 = 원래 크기, 작을수록 가루처럼)
+    const JITTER = 0.6;           // 퍼지는 방향의 무작위성 (0 = 정확히 바깥으로, 1 = 제멋대로)
+    // ===============================
+
+    const f = (x) => Number(x).toFixed(4);
+    const v3 = (a) => `vec3(${a.map(f).join(", ")})`;
+
+    // --- 기본 장면 ---
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BACKGROUND);
+    scene.add(new SparkRenderer({ renderer }));
+
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 1.6);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.update();
+
+    // --- 스플랫 불러오기 ---
+    const splat = new SplatMesh({ url: SPLAT_FILE });
+    // 파일에서는 재떨이가 바닥에 누워 있어서, 얼굴이 화면을 보도록 세움
+    splat.quaternion.set(0.5, -0.5, 0.5, -0.5);
+    splat.position.set(0.005, 0.024, 0);  // 화면 가운데로
+    scene.add(splat);
+
+    // 화면 비율에 맞춰 재떨이가 다 보이도록 카메라 거리 조절
+    function fitCamera() {
+      const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+      const needW = 0.65 / (Math.tan(halfFov) * camera.aspect);  // 가로로 다 보이게
+      const needH = 0.6 / Math.tan(halfFov);                     // 세로로 다 보이게
+      camera.position.set(0, 0, Math.max(needW, needH));
+      controls.update();
+    }
+    fitCamera();
+
+    // --- 점 하나하나를 움직이는 셰이더 ---
+    const uTime = dyno.dynoFloat(0);
+    const uFaceOn = dyno.dynoFloat(1); // 0 = 멈춤(제자리), 1 = 숨쉬기
+    const uBowOn = dyno.dynoFloat(1);
+
+    splat.objectModifier = dyno.dynoBlock(
+      { gsplat: dyno.Gsplat },
+      { gsplat: dyno.Gsplat },
+      ({ gsplat }) => {
+        const d = dyno.dyno({
+          inTypes: { gsplat: dyno.Gsplat, time: "float", faceOn: "float", bowOn: "float" },
+          outTypes: { gsplat: dyno.Gsplat },
+          inputs: { gsplat, time: uTime, faceOn: uFaceOn, bowOn: uBowOn },
+          globals: () => [`
+            vec4 partHash4(uint n) {
+              uvec4 s = uvec4(n) * uvec4(747796405u, 2891336453u, 1442695041u, 3141592653u) + uvec4(1u, 7u, 13u, 29u);
+              s = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+              s = (s >> 22u) ^ s;
+              return vec4(s) / 4294967295.0;
+            }
+          `],
+          statements: ({ inputs, outputs }) => {
+            const g = inputs.gsplat, o = outputs.gsplat;
+            return dyno.unindentLines(`
+              ${o} = ${g};
+              vec3 c = ${g}.center;
+              vec4 h = partHash4(uint(${g}.index));
+
+              // 이 점은 리본인가 얼굴인가
+              float isBow = step(c.y, ${f(SPLIT_Y)});
+              vec3  partCenter = mix(${v3(FACE_CENTER)}, ${v3(BOW_CENTER)}, isBow);
+              float spread = mix(${f(FACE.spread)}, ${f(BOW.spread)}, isBow);
+              float period = mix(${f(FACE.period)}, ${f(BOW.period)}, isBow);
+              float phase  = mix(${f(FACE.phase)},  ${f(BOW.phase)},  isBow);
+              float on     = mix(${inputs.faceOn}, ${inputs.bowOn}, isBow);
+
+              // 숨쉬기: 0(제자리) → 1(퍼짐) → 0, 점마다 조금씩 늦게 출발
+              float w = 0.5 - 0.5 * cos(6.2831853 * (${inputs.time} / period + phase - h.w * 0.15));
+              float amount = w * w * (3.0 - 2.0 * w) * on;
+
+              // 부위 중심에서 바깥쪽으로 + 무작위
+              vec3 out_ = c - partCenter;
+              vec3 rnd  = h.xyz * 2.0 - 1.0;
+              vec3 dir  = normalize(normalize(out_ + 1e-4) * (1.0 - ${f(JITTER)}) + rnd * ${f(JITTER)} + 1e-4);
+              float dist = spread * (0.4 + 0.6 * h.x);
+
+              // 퍼진 상태에서 살짝 떠다니기
+              vec3 drift = 0.015 * vec3(sin(${inputs.time} * 2.1 + h.y * 6.28), sin(${inputs.time} * 1.7 + h.z * 6.28), sin(${inputs.time} * 2.5 + h.x * 6.28));
+
+              ${o}.center = c + amount * (dir * dist + drift);
+              ${o}.scales *= mix(1.0, ${f(PARTICLE_SIZE)}, amount);
+            `);
+          },
+        });
+        return { gsplat: d.outputs.gsplat };
+      }
+    );
+    splat.updateGenerator();
+
+    // --- 켜고 끄기 (부드럽게) ---
+    const target = { face: 1, bow: 1 };
+    const faceBtn = document.getElementById("faceBtn");
+    const bowBtn = document.getElementById("bowBtn");
+    function toggle(part) {
+      target[part] = target[part] ? 0 : 1;
+      const btn = part === "face" ? faceBtn : bowBtn;
+      btn.setAttribute("aria-pressed", target[part] ? "true" : "false");
+      btn.textContent = (part === "face" ? "얼굴 " : "리본 ") + (target[part] ? "⏸" : "▶");
+    }
+    faceBtn.onclick = () => toggle("face");
+    bowBtn.onclick = () => toggle("bow");
+
+    // --- 클릭한 곳이 얼굴인지 리본인지 ---
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let downAt = null;
+    renderer.domElement.addEventListener("pointerdown", (e) => (downAt = [e.clientX, e.clientY]));
+    renderer.domElement.addEventListener("pointerup", (e) => {
+      if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return; // 드래그는 무시
+      pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObject(splat)[0];
+      if (!hit) return;
+      const local = splat.worldToLocal(hit.point.clone());
+      toggle(local.y < SPLIT_Y ? "bow" : "face");
+    });
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      fitCamera();
+    });
+
+    await splat.initialized;
+    document.getElementById("loading").remove();
+
+    const timer = new THREE.Timer();
+    renderer.setAnimationLoop((t) => {
+      timer.update(t);
+      const dt = Math.min(timer.getDelta(), 0.1);
+      uTime.value += dt;
+      uFaceOn.value += (target.face - uFaceOn.value) * Math.min(dt * 3, 1);
+      uBowOn.value += (target.bow - uBowOn.value) * Math.min(dt * 3, 1);
+      splat.updateVersion();
+      controls.update();
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
